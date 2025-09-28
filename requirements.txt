@@ -1,0 +1,13 @@
+streamlit
+openai
+pandas
+numpy
+matplotlib
+PyPDF2
+pytesseract
+Pillow
+SpeechRecognition
+schedule
+requests
+python-dotenv
+scikit-learn
