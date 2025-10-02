@@ -1,54 +1,53 @@
+# utils.py
+import os
 import smtplib
 from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
 import requests
 
-# =========================
-# Gửi Email qua Gmail SMTP
-# =========================
-def send_email(subject, body, to_email, from_email, password):
-    """
-    Hàm gửi email cơ bản.
-    subject: tiêu đề email
-    body: nội dung email
-    to_email: người nhận
-    from_email: Gmail của bạn
-    password: App Password (không dùng mật khẩu Gmail thường)
-    """
+# ==== GỬI EMAIL ====
+def send_email(subject: str, body: str, to_email: str):
     try:
-        msg = MIMEText(body, "plain", "utf-8")
-        msg['Subject'] = subject
-        msg['From'] = from_email
-        msg['To'] = to_email
+        email_user = os.getenv("EMAIL_USER")
+        email_password = os.getenv("EMAIL_PASSWORD")
 
-        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
-            server.login(from_email, password)
-            server.sendmail(from_email, [to_email], msg.as_string())
-        return True
+        msg = MIMEMultipart()
+        msg["From"] = email_user
+        msg["To"] = to_email
+        msg["Subject"] = subject
+        msg.attach(MIMEText(body, "plain", "utf-8"))
+
+        server = smtplib.SMTP("smtp.gmail.com", 587)
+        server.starttls()
+        server.login(email_user, email_password)
+        server.sendmail(email_user, to_email, msg.as_string())
+        server.quit()
+        return "✅ Email đã được gửi thành công."
     except Exception as e:
-        print("Lỗi khi gửi email:", e)
-        return False
+        return f"❌ Lỗi gửi email: {e}"
 
 
-# =========================
-# Gửi tin nhắn qua Zalo API
-# =========================
-def send_zalo_message(access_token, user_id, message):
-    """
-    Hàm gửi tin nhắn Zalo OA.
-    access_token: ZALO_ACCESS_TOKEN
-    user_id: ZALO_USER_ID (ID người nhận)
-    message: nội dung tin nhắn
-    """
+# ==== GỬI TIN NHẮN ZALO ====
+def send_zalo_message(message: str):
     try:
+        access_token = os.getenv("ZALO_ACCESS_TOKEN")
+        user_id = os.getenv("ZALO_USER_ID")
         url = "https://openapi.zalo.me/v2.0/oa/message"
-        headers = {"access_token": access_token}
+
+        headers = {
+            "access_token": access_token,
+            "Content-Type": "application/json"
+        }
+
         data = {
             "recipient": {"user_id": user_id},
             "message": {"text": message}
         }
-        response = requests.post(url, headers=headers, json=data)
-        return response.json()
-    except Exception as e:
-        print("Lỗi khi gửi Zalo:", e)
-        return {"error": str(e)}
 
+        response = requests.post(url, headers=headers, json=data)
+        if response.status_code == 200:
+            return "✅ Tin nhắn Zalo đã được gửi thành công."
+        else:
+            return f"❌ Lỗi gửi Zalo: {response.text}"
+    except Exception as e:
+        return f"❌ Lỗi gửi Zalo: {e}"

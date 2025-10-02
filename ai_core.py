@@ -2,25 +2,22 @@
 import os
 from openai import OpenAI
 
-# Lấy API key từ biến môi trường (Render -> Environment Variables)
+# Lấy API key từ biến môi trường
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
-def ai_pipeline(prompt: str) -> str:
+def ai_pipeline(prompt: str, model: str = "gpt-4o-mini", temperature: float = 0.3) -> str:
     """
-    Hàm pipeline AI đơn giản:
-    - Nhận vào prompt (câu hỏi văn bản)
-    - Gửi tới OpenAI GPT-4o-mini
-    - Trả về câu trả lời
+    Gửi prompt đến OpenAI GPT và trả về kết quả.
     """
     try:
         response = client.chat.completions.create(
-            model="gpt-4o-mini",   # model nhỏ, rẻ, chạy nhanh
+            model=model,
             messages=[
-                {"role": "system", "content": "Bạn là trợ lý AI thông minh và hữu ích."},
+                {"role": "system", "content": "Bạn là trợ lý AI hành chính NgọcMinhChâu."},
                 {"role": "user", "content": prompt}
-            ]
+            ],
+            temperature=temperature
         )
         return response.choices[0].message.content
     except Exception as e:
-        return f"Lỗi khi gọi AI: {e}"
-
+        return f"Lỗi khi gọi OpenAI API: {e}"
