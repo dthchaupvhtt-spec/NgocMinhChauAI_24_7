@@ -1,17 +1,24 @@
 # app.py
-# NgọcMinhChâu AI — Frontend Streamlit (Phiên bản modern)
-# Yêu cầu: OPENAI_API_KEY được thiết lập (env), và ai_core.py + utils.py tồn tại trong repo.
+# NgọcMinhChâu-AI - Full dashboard theo tài liệu (login + dashboard with full features)
+# Lưu ý: cần ai_core.py (ai_pipeline) và utils.py (send_email, send_zalo_message) có sẵn
+# Cài các package theo requirements.txt
 
 import os
-from pathlib import Path
-from datetime import datetime
 import io
 import json
 import zipfile
+import threading
+from pathlib import Path
+from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor
 
 import streamlit as st
+from dotenv import load_dotenv
 
-# ----- Try imports (graceful fallback) -----
+# Load .env nếu có (local dev)
+load_dotenv()
+
+# Try imports optional
 try:
     import pandas as pd
 except Exception:
@@ -38,65 +45,58 @@ except Exception:
     sr = None
 
 try:
+    import docx
+except Exception:
+    docx = None
+
+try:
+    from gtts import gTTS
+except Exception:
+    gTTS = None
+
+try:
     import matplotlib.pyplot as plt
 except Exception:
     plt = None
 
-try:
-    import numpy as np
-    from sklearn.linear_model import LinearRegression
-except Exception:
-    np = None
-    LinearRegression = None
-
-# ----- import project modules -----
-# ai_core should implement ai_pipeline(prompt: str) -> str
-# utils should implement send_email(subject, body, to) and send_zalo_message(text)
+# import project modules (ai_core, utils)
 try:
     from ai_core import ai_pipeline
 except Exception as e:
     ai_pipeline = None
-    AI_IMPORT_ERROR = str(e)
+    AI_CORE_ERROR = str(e)
 else:
-    AI_IMPORT_ERROR = None
+    AI_CORE_ERROR = None
 
 try:
     from utils import send_email, send_zalo_message
-except Exception:
+except Exception as e:
     send_email = None
     send_zalo_message = None
 
-# ----- Config and folders -----
+# ------------------------
+# Config paths + env
+# ------------------------
 st.set_page_config(page_title="NgọcMinhChâu AI", layout="wide", page_icon="💎")
 ROOT = Path.cwd()
 INPUT_DIR = ROOT / "input_data"
 OUTPUT_DIR = ROOT / "output_data"
 HISTORY_DIR = ROOT / "report_history"
+LOGS_DIR = ROOT / "logs"
+for d in (INPUT_DIR, OUTPUT_DIR, HISTORY_DIR, LOGS_DIR):
+    d.mkdir(parents=True, exist_ok=True)
 HISTORY_FILE = HISTORY_DIR / "history.json"
 
-for d in (INPUT_DIR, OUTPUT_DIR, HISTORY_DIR):
-    d.mkdir(parents=True, exist_ok=True)
+OPENAI_KEY = os.getenv("OPENAI_API_KEY")
+ADMIN_USER = os.getenv("ADMIN_USER", "admin")
+ADMIN_PASS = os.getenv("ADMIN_PASS", "changeme")
 
-OPENAI_CONFIGURED = bool(os.getenv("OPENAI_API_KEY", ""))
+# Thread pool for background tasks
+executor = ThreadPoolExecutor(max_workers=3)
 
-# ----- CSS styling for nicer UI -----
-st.markdown(
-    """
-    <style>
-    /* page */
-    .big-title { font-size:28px; font-weight:700; color:#0f172a; }
-    .muted { color:#6b7280; }
-    .card { border-radius:12px; padding:16px; background:linear-gradient(180deg,#ffffff,#fbfdff); box-shadow:0 6px 18px rgba(15,23,42,0.06); }
-    .side-title { font-size:18px; font-weight:600; color:#0f172a; }
-    .small-muted { color:#94a3b8; font-size:12px; }
-    .chat-user { background:#dbeafe; padding:10px; border-radius:10px; }
-    .chat-ai { background:#eef2ff; padding:10px; border-radius:10px; }
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
-
-# ----- Utilities: history -----
+# ------------------------
+# Helpers: history persistence
+# ------------------------
 def load_history():
     if HISTORY_FILE.exists():
         try:
@@ -105,30 +105,41 @@ def load_history():
             return []
     return []
 
-def save_history(items):
+def save_history(h):
     HISTORY_DIR.mkdir(parents=True, exist_ok=True)
-    HISTORY_FILE.write_text(json.dumps(items, ensure_ascii=False, indent=2), encoding="utf-8")
+    HISTORY_FILE.write_text(json.dumps(h, ensure_ascii=False, indent=2), encoding="utf-8")
 
-def add_history(record: dict):
+def add_history(rec: dict):
     h = load_history()
-    h.append(record)
+    h.append(rec)
     save_history(h)
 
-# ----- File extractors -----
+# ------------------------
+# Helpers: file extractors (graceful)
+# ------------------------
 def extract_text_from_pdf(path: Path):
     if PyPDF2 is None:
         return "[PyPDF2 chưa cài]"
     try:
-        texts = []
+        out = []
         with open(path, "rb") as f:
             reader = PyPDF2.PdfReader(f)
             for p in reader.pages:
                 t = p.extract_text()
                 if t:
-                    texts.append(t)
-        return "\n".join(texts)
+                    out.append(t)
+        return "\n".join(out)
     except Exception as e:
         return f"[Lỗi đọc PDF] {e}"
+
+def extract_text_from_docx(path: Path):
+    if docx is None:
+        return "[python-docx chưa cài]"
+    try:
+        d = docx.Document(path)
+        return "\n".join(p.text for p in d.paragraphs)
+    except Exception as e:
+        return f"[Lỗi docx] {e}"
 
 def extract_text_from_image(path: Path):
     if Image is None or pytesseract is None:
@@ -150,18 +161,7 @@ def extract_text_from_audio(path: Path):
     except Exception as e:
         return f"[Lỗi speech->text] {e}"
 
-def extract_text_from_docx(path: Path):
-    try:
-        import docx
-    except Exception:
-        return "[python-docx chưa cài]"
-    try:
-        doc = docx.Document(path)
-        return "\n".join(p.text for p in doc.paragraphs)
-    except Exception as e:
-        return f"[Lỗi docx] {e}"
-
-def read_excel_as_df(path: Path):
+def read_excel_df(path: Path):
     if pd is None:
         return None, "[pandas chưa cài]"
     try:
@@ -170,253 +170,449 @@ def read_excel_as_df(path: Path):
     except Exception as e:
         return None, f"[Lỗi đọc Excel] {e}"
 
-# ----- Simple forecast & anomaly detection -----
-def forecast_and_detect(df):
-    if LinearRegression is None or np is None:
-        return {}, {}
-    numeric = df.select_dtypes(include="number").columns
-    forecasts = {}
-    alerts = {}
-    for col in numeric:
-        series = df[col].dropna().values
-        if len(series) < 4:
-            continue
-        X = np.arange(len(series)).reshape(-1, 1)
-        model = LinearRegression().fit(X, series)
-        pred = float(model.predict([[len(series)]])[0])
-        forecasts[col] = pred
-        mean = float(np.mean(series)); std = float(np.std(series))
-        anomalies = []
-        for i, val in enumerate(series):
-            if abs(val - mean) > 2 * std:
-                anomalies.append({"index": int(i), "value": float(val)})
-        if anomalies:
-            alerts[col] = anomalies
-    return forecasts, alerts
+# ------------------------
+# UI: small CSS & copy-to-clipboard helper
+# ------------------------
+st.markdown("""
+<style>
+.big-title { font-size:26px; font-weight:700; color:#0b3d91; }
+.card { border-radius:10px; padding:14px; background: #fff; box-shadow: 0 4px 18px rgba(11, 61, 145, 0.06); }
+.chat-user { background: #E6F0FF; padding:10px; border-radius:8px; }
+.chat-ai { background: #F3F7FF; padding:10px; border-radius:8px; }
+.small-muted { color:#6b7280; font-size:13px; }
+</style>
+""", unsafe_allow_html=True)
 
-# ----- Tiny semantic store (in-memory) - optional -----
-VECTOR_STORE = []
+# copy-to-clipboard: use component HTML
+def copy_button_js(text, key):
+    # returns HTML that copies 'text' to clipboard when clicked
+    escaped = text.replace("\\", "\\\\").replace("'", "\\'").replace("\n", "\\n")
+    html = f"""
+    <button onclick="navigator.clipboard.writeText('{escaped}')" style="padding:6px 10px;border-radius:6px;border:none;background:#0b63c4;color:white;cursor:pointer;">
+        📋 Copy
+    </button>
+    """
+    st.components.v1.html(html, height=40, key=key)
 
-def add_to_vector_store(id_, text, embedding=None):
-    VECTOR_STORE.append({"id": id_, "text": text, "embedding": embedding})
+# standardized action buttons (Copy / Delete / Download)
+def action_buttons_for_text(text: str, filename: str = "output.txt", file_bytes: bytes = None, key_prefix="act"):
+    cols = st.columns([1,1,1])
+    with cols[0]:
+        # copy using JS
+        try:
+            copy_button_js(text, key=key_prefix+"_copy")
+            st.caption("Sao chép toàn bộ nội dung")
+        except Exception:
+            st.button("📋 Copy", key=key_prefix+"_copy_fallback")
+    with cols[1]:
+        if st.button("🗑 Xóa", key=key_prefix+"_delete"):
+            return "delete"
+    with cols[2]:
+        if file_bytes is not None:
+            st.download_button("⬇ Tải về", file_bytes, file_name=filename, key=key_prefix+"_dl")
+        else:
+            st.download_button("⬇ Tải về (TXT)", text, file_name=filename, key=key_prefix+"_dl_txt")
+    return None
 
-# ----- Sidebar -----
-with st.sidebar:
-    st.image("logo.png" if Path("logo.png").exists() else "https://i.ibb.co/0s3pdnc/sample-logo.png", width=140)
-    st.markdown("<div class='side-title'>NgọcMinhChâu AI — Trợ lý hành chính</div>", unsafe_allow_html=True)
-    st.write("Hỗ trợ: soạn công văn, báo cáo, tổng hợp số liệu, gửi thông báo.")
-    st.markdown("---")
-    st.markdown("### Cấu hình nhanh")
-    st.write("OpenAI:", "✅" if OPENAI_CONFIGURED else "❌")
-    if not OPENAI_CONFIGURED:
-        st.warning("OpenAI API chưa cấu hình. Vui lòng đặt OPENAI_API_KEY trong Environment.")
-    st.markdown("---")
-    if st.button("🔄 Reset phiên làm việc"):
-        # reset session variables related to chat
-        keys = [k for k in st.session_state.keys() if k.startswith("chat_") or k in ("uploaded_file",)]
-        for k in keys:
-            del st.session_state[k]
-        st.success("Đã reset phiên. Refresh trang.")
-        st.rerun()
-    st.markdown("---")
-    st.markdown("<div class='small-muted'>Phiên bản demo — Liên hệ để triển khai nâng cao</div>", unsafe_allow_html=True)
-
-# ----- Main layout: tabs -----
-tabs = st.tabs(["🏠 Trang chủ", "💬 Chat AI", "📂 Upload & Xử lý", "📈 Phân tích Excel", "📜 Lịch sử", "⚙️ Cấu hình & Gửi"])
-
-# ----- Tab: Home -----
-with tabs[0]:
-    st.markdown("<div class='big-title'>NgọcMinhChâu AI</div>", unsafe_allow_html=True)
-    st.write("Trợ lý AI chuyên cho công chức xã — tự động hóa văn bản, tổng hợp báo cáo, phân tích dữ liệu và phân phối văn bản.")
-    c1, c2, c3 = st.columns([2,1,1])
-    with c1:
-        st.markdown("#### Thử lệnh nhanh")
-        sample = st.selectbox("Chọn mẫu", [
-            "Soạn công văn thông báo họp ngày ...",
-            "Tóm tắt biên bản cuộc họp",
-            "Soạn kế hoạch triển khai chuyển đổi số"
-        ])
-        q = st.text_input("Hoặc nhập yêu cầu:", value=sample)
-        if st.button("Gửi lệnh (Nhanh)"):
-            if ai_pipeline is None:
-                st.error(f"AI chưa sẵn sàng: {AI_IMPORT_ERROR}")
-            else:
-                with st.spinner("AI đang xử lý..."):
-                    ans = ai_pipeline(q)
-                st.success("Hoàn tất")
-                st.code(ans)
-    with c2:
-        st.markdown("#### Tài nguyên nhanh")
-        st.write("- Upload file: PDF / Word / Excel / Image / Audio")
-        st.write("- Xem Lịch sử, Backup, Tải báo cáo")
-    with c3:
-        st.markdown("#### Trạng thái")
-        st.write(f"- OpenAI key: {'OK' if OPENAI_CONFIGURED else 'Chưa'}")
-        st.write(f"- Files trong input_data: {len(list(INPUT_DIR.iterdir()))}")
-
-# ----- Tab: Chat AI -----
-with tabs[1]:
-    st.subheader("Chat trực tiếp với AI")
-    if "chat_history" not in st.session_state:
-        st.session_state.chat_history = []
-    chat_col, info_col = st.columns([3,1])
-    with chat_col:
-        prompt = st.text_area("Nhập câu hỏi / yêu cầu:", key="chat_input", height=140)
-        if st.button("Gửi yêu cầu"):
-            if not ai_pipeline:
-                st.error("Hàm ai_pipeline chưa được cấu hình hoặc import thất bại.")
-            elif not OPENAI_CONFIGURED:
-                st.error("OPENAI_API_KEY chưa cấu hình.")
-            else:
-                with st.spinner("Gọi AI..."):
-                    response = ai_pipeline(prompt)
-                st.session_state.chat_history.append({"role":"user","text":prompt,"response":response,"ts":datetime.now().isoformat()})
-                add_history({"type":"chat","prompt":prompt,"response":response,"timestamp":datetime.now().isoformat()})
-                st.experimental_set_query_params()  # harmless - just to update URL if needed
+# ------------------------
+# Login screen
+# ------------------------
+def login_ui():
+    st.markdown("<div class='big-title'>NgọcMinhChâu AI — Đăng nhập</div>", unsafe_allow_html=True)
+    st.write("Đăng nhập để truy cập Dashboard. (Phiên bản demo — thay bằng OAuth/SSO khi production)")
+    col1, col2 = st.columns([1,1])
+    with col1:
+        username = st.text_input("Tài khoản")
+        password = st.text_input("Mật khẩu", type="password")
+        if st.button("Đăng nhập"):
+            if username == ADMIN_USER and password == ADMIN_PASS:
+                st.session_state['logged_in'] = True
+                st.success("Đăng nhập thành công")
                 st.rerun()
-    with info_col:
-        st.markdown("**Phiên gần đây**")
-        for item in reversed(st.session_state.get("chat_history", [])[-6:]):
-            st.markdown(f"- **Bạn:** {item['text']}")
-            st.markdown(f"  - **AI:** {item['response'][:200]}...")
+            else:
+                st.error("Sai tài khoản hoặc mật khẩu.")
+    with col2:
+        st.markdown("**Hướng dẫn nhanh**")
+        st.write("- Thử tài khoản mặc định (ENV ADMIN_USER/ADMIN_PASS).")
+        st.write("- Không lưu API Key trong repo, đặt trên Render.")
 
-    # display chat conversation
-    st.markdown("----")
-    for i, item in enumerate(st.session_state.get("chat_history", [])):
-        if item["role"] == "user":
-            st.markdown(f"<div class='chat-user'>{item['text']}</div>", unsafe_allow_html=True)
-            st.markdown(f"<div class='chat-ai small-muted'>{item['response']}</div>", unsafe_allow_html=True)
+if not st.session_state.get("logged_in", False):
+    login_ui()
+    st.stop()
 
-# ----- Tab: Upload & Processing -----
-with tabs[2]:
-    st.subheader("Upload file để AI xử lý")
-    uploaded = st.file_uploader("Chọn file (PDF / Image / Excel / DOCX / Audio)", accept_multiple_files=False)
-    if uploaded:
-        target = INPUT_DIR / uploaded.name
-        with open(target, "wb") as f:
-            f.write(uploaded.getbuffer())
-        st.success(f"Đã lưu: {uploaded.name}")
-        st.markdown("### Trích xuất nội dung")
+# ------------------------
+# Dashboard layout & menu
+# ------------------------
+st.sidebar.image("logo.png" if Path("logo.png").exists() else "https://i.ibb.co/0s3pdnc/sample-logo.png", width=130)
+st.sidebar.markdown("## NgọcMinhChâu AI")
+menu = st.sidebar.radio("Chọn mục:", [
+    "🏠 Trang chính",
+    "💬 Chat với NgocMinhChau",
+    "📑 Báo cáo của tôi",
+    "📜 Quy chế",
+    "📝 Công văn",
+    "📊 Kế hoạch",
+    "🔊 Chuyển văn bản -> Giọng nói",
+    "🎥 Video của tôi",
+    "➕ Loại khác",
+    "⚙️ Cấu hình & Gửi"
+])
+
+st.sidebar.markdown("---")
+st.sidebar.markdown("Lập trình: **Đoàn Thanh Châu** — SĐT: 0966313456")
+st.sidebar.markdown("[Facebook](https://facebook.com) • [Zalo](#) • [YouTube](#) • [TikTok](#)")
+
+# Quick state defaults
+if "chat_history" not in st.session_state:
+    st.session_state.chat_history = []
+if "last_output" not in st.session_state:
+    st.session_state.last_output = ""
+if "last_file_bytes" not in st.session_state:
+    st.session_state.last_file_bytes = None
+if "last_filename" not in st.session_state:
+    st.session_state.last_filename = "output.txt"
+
+# ------------------------
+# Common: run AI safely
+# ------------------------
+def call_ai(prompt: str, system: str = None):
+    if ai_pipeline is None:
+        return f"[ai_core chưa sẵn sàng] {AI_CORE_ERROR or ''}"
+    if not OPENAI_KEY:
+        return "[OPENAI_API_KEY chưa được cấu hình]"
+    try:
+        return ai_pipeline(prompt)
+    except Exception as e:
+        return f"[Lỗi khi gọi AI] {e}"
+
+# ------------------------
+# Function: process uploaded file in background
+# ------------------------
+def background_process_file(path: Path, task_type: str = "report"):
+    def job():
         txt = ""
-        if uploaded.name.lower().endswith(".pdf"):
-            txt = extract_text_from_pdf(target)
-        elif uploaded.name.lower().endswith((".png",".jpg",".jpeg",".tiff")):
-            txt = extract_text_from_image(target)
-        elif uploaded.name.lower().endswith((".wav",".mp3",".flac")):
-            txt = extract_text_from_audio(target)
-        elif uploaded.name.lower().endswith(".docx"):
-            txt = extract_text_from_docx(target)
-        elif uploaded.name.lower().endswith((".xls",".xlsx",".csv")):
-            df, err = read_excel_as_df(target)
+        ext = path.suffix.lower()
+        if ext == ".pdf":
+            txt = extract_text_from_pdf(path)
+        elif ext == ".docx":
+            txt = extract_text_from_docx(path)
+        elif ext in (".png", ".jpg", ".jpeg", ".tiff"):
+            txt = extract_text_from_image(path)
+        elif ext in (".wav", ".mp3", ".flac"):
+            txt = extract_text_from_audio(path)
+        elif ext in (".xls", ".xlsx", ".csv"):
+            df, err = read_excel_df(path)
             if err:
                 txt = err
             else:
                 txt = df.to_string()
         else:
             try:
-                txt = uploaded.getvalue().decode(errors="ignore")
-            except Exception:
-                txt = "[Không thể giải mã file]"
+                txt = path.read_text(encoding="utf-8")
+            except:
+                txt = "[Không đọc được file]"
 
-        st.text_area("Nội dung trích xuất (xem nhanh)", txt[:4000], height=260)
-
-        # Lưu tạm và tạo báo cáo
-        if st.button("Tạo báo cáo từ file"):
-            if not ai_pipeline:
-                st.error("ai_pipeline chưa sẵn sàng.")
-            else:
-                with st.spinner("AI tạo báo cáo..."):
-                    prompt = f"Bạn là trợ lý hành chính. Từ nội dung sau, soạn thành báo cáo hành chính rõ ràng:\n\n{txt[:6000]}"
-                    if st.session_state.get("style_note"):
-                        prompt = st.session_state["style_note"] + "\n\n" + prompt
-                    report = ai_pipeline(prompt)
-                out_name = OUTPUT_DIR / f"report_{uploaded.name}_{datetime.now().strftime('%Y%m%d%H%M%S')}.txt"
-                out_name.write_text(report, encoding="utf-8")
-                add_history({"type":"report","source":uploaded.name,"path":str(out_name),"timestamp":datetime.now().isoformat(),"preview":report[:800]})
-                st.success("Đã tạo báo cáo")
-                st.download_button("Tải báo cáo (TXT)", report, file_name=out_name.name)
-                st.text_area("Báo cáo (chi tiết)", report, height=360)
-
-# ----- Tab: Excel Analysis -----
-with tabs[3]:
-    st.subheader("Phân tích Excel: biểu đồ, dự báo & phát hiện bất thường")
-    excel_files = [p for p in INPUT_DIR.iterdir() if p.suffix.lower() in (".xlsx",".xls",".csv")]
-    if len(excel_files) == 0:
-        st.info("Chưa có file Excel trong input_data. Upload trong tab Upload & Xử lý.")
-    else:
-        sel = st.selectbox("Chọn file Excel", [p.name for p in excel_files])
-        df = pd.read_excel(INPUT_DIR / sel) if pd else None
-        if df is None:
-            st.error("Pandas chưa cài; không thể phân tích.")
+        if task_type == "report":
+            prompt = f"Bạn là trợ lý hành chính. Từ nội dung sau, tạo 1 báo cáo hành chính rõ ràng, có Mục tiêu, Tóm tắt, Phân tích, Kết luận, Đề xuất:\n\n{txt[:6000]}"
+            report = call_ai(prompt)
+            out_path = OUTPUT_DIR / f"report_{path.stem}_{datetime.now().strftime('%Y%m%d%H%M%S')}.txt"
+            out_path.write_text(report, encoding="utf-8")
+            add_history({"type":"report","source":path.name,"path":str(out_path),"timestamp":datetime.now().isoformat(),"preview":report[:800]})
         else:
-            st.dataframe(df.head(200))
-            if st.button("Phân tích & Dự báo"):
-                with st.spinner("Đang phân tích..."):
-                    forecasts, alerts = forecast_and_detect(df)
-                st.markdown("#### Dự báo")
-                st.json(forecasts)
-                if alerts:
-                    st.warning("Phát hiện bất thường")
-                    st.json(alerts)
-                # Vẽ biểu đồ (numeric first)
-                nums = df.select_dtypes(include="number").columns.tolist()
-                if nums and plt:
-                    fig, ax = plt.subplots()
-                    ax.plot(df[nums[0]].fillna(method="ffill").values)
-                    ax.set_title(nums[0])
-                    st.pyplot(fig)
+            out_path = OUTPUT_DIR / f"processed_{path.stem}_{datetime.now().strftime('%Y%m%d%H%M%S')}.txt"
+            out_path.write_text(txt, encoding="utf-8")
+            add_history({"type":"process","source":path.name,"path":str(out_path),"timestamp":datetime.now().isoformat(),"preview":txt[:800]})
+        return str(out_path)
+    fut = executor.submit(job)
+    return fut
 
-# ----- Tab: History -----
-with tabs[4]:
-    st.subheader("Lịch sử xử lý")
-    history = load_history()
-    if not history:
-        st.info("Chưa có lịch sử.")
-    else:
-        for i, rec in enumerate(reversed(history[-100:]), 1):
-            st.markdown(f"**{i}.** `{rec.get('type','?')}` — {rec.get('timestamp')}")
-            if rec.get("preview"):
-                st.write(rec.get("preview"))
-            if rec.get("path") and Path(rec["path"]).exists():
-                with open(rec["path"], "rb") as fh:
-                    st.download_button("Tải file", fh, file_name=Path(rec["path"]).name)
+# ------------------------
+# Menu handlers
+# ------------------------
 
-    if st.button("Tạo backup ZIP tất cả báo cáo"):
-        ts = datetime.now().strftime("%Y%m%d%H%M%S")
-        zname = OUTPUT_DIR / f"backup_reports_{ts}.zip"
-        with zipfile.ZipFile(zname, "w") as z:
-            for f in OUTPUT_DIR.glob("report_*.txt"):
-                z.write(f, arcname=f.name)
-        with open(zname, "rb") as fh:
-            st.download_button("Tải ZIP backup", fh, file_name=zname.name)
+# --- Trang chính
+if menu == "🏠 Trang chính":
+    st.markdown("<div class='big-title'>NgọcMinhChâu AI — Nhiệm vụ hoàn thành trong nháy mắt!</div>", unsafe_allow_html=True)
+    st.write("Hệ thống trợ giúp công chức xã: soạn công văn, báo cáo, phân tích dữ liệu, gửi thông báo.")
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        st.subheader("💬 Chat với AI")
+        st.write("Trò chuyện, soạn công văn, hỗ trợ soạn thảo.")
+        if st.button("Bắt đầu Chat"):
+            st.session_state['nav_to'] = "💬 Chat với NgocMinhChau"
+            st.rerun()
+    with c2:
+        st.subheader("📑 Báo cáo")
+        st.write("Upload tài liệu → Tạo báo cáo tự động.")
+        if st.button("Mở Báo cáo"):
+            st.session_state['nav_to'] = "📑 Báo cáo của tôi"
+            st.rerun()
+    with c3:
+        st.subheader("📊 Phân tích Excel")
+        st.write("Phân tích số liệu, phát hiện bất thường.")
+        if st.button("Mở Phân tích"):
+            st.session_state['nav_to'] = "📊 Kế hoạch"
+            st.rerun()
 
-# ----- Tab: Config & Send -----
-with tabs[5]:
-    st.subheader("Cấu hình & Gửi thông báo")
-    st.write("Các biến môi trường (Render / .env): OPENAI_API_KEY, EMAIL_USER, EMAIL_PASSWORD, ZALO_ACCESS_TOKEN, ZALO_USER_ID")
-    st.markdown("### Gửi Email thử")
+# --- Chat
+elif menu == "💬 Chat với NgocMinhChau":
+    st.header("💬 Chat trực tiếp với NgocMinhChau")
+    st.markdown("Chọn chế độ: ", unsafe_allow_html=True)
+    chat_mode = st.radio("Chế độ Chat:", ["Trợ lý hành chính", "Soạn công văn", "Soạn báo cáo", "Truy vấn văn bản"])
+    with st.form("chat_form"):
+        user_input = st.text_area("Nhập yêu cầu:", height=160)
+        submitted = st.form_submit_button("Gửi")
+        if submitted and user_input.strip():
+            sys_prompt = {
+                "Trợ lý hành chính": "Bạn là trợ lý hành chính, trả lời ngắn gọn, rõ ràng.",
+                "Soạn công văn": "Bạn là chuyên gia soạn thảo công văn theo mẫu hành chính Việt Nam.",
+                "Soạn báo cáo": "Bạn là chuyên gia viết báo cáo hành chính chi tiết.",
+                "Truy vấn văn bản": "Bạn là trợ lý pháp lý, trả lời có dẫn nguồn (nếu có)."
+            }.get(chat_mode, "")
+            with st.spinner("AI đang xử lý..."):
+                ans = call_ai(user_input, system=sys_prompt)
+            # save to session & history
+            st.session_state.chat_history.append({"role":"user","text":user_input,"ts":datetime.now().isoformat()})
+            st.session_state.chat_history.append({"role":"ai","text":ans,"ts":datetime.now().isoformat()})
+            add_history({"type":"chat","mode":chat_mode,"prompt":user_input,"response":ans,"timestamp":datetime.now().isoformat()})
+            st.session_state.last_output = ans
+            st.session_state.last_filename = f"chat_{datetime.now().strftime('%Y%m%d%H%M%S')}.txt"
+            st.session_state.last_file_bytes = None
+            st.experimental_rerun()
+    st.markdown("### Phiên gần đây")
+    for item in reversed(st.session_state.chat_history[-10:]):
+        if item["role"] == "user":
+            st.markdown(f"<div class='chat-user'>**Bạn:** {item['text']}</div>", unsafe_allow_html=True)
+        else:
+            st.markdown(f"<div class='chat-ai'>**AI:** {item['text']}</div>", unsafe_allow_html=True)
+    if st.session_state.last_output:
+        st.markdown("### Kết quả mới nhất")
+        st.text_area("Kết quả", st.session_state.last_output, height=240)
+        res = action_buttons_for_text(st.session_state.last_output, filename=st.session_state.last_filename, file_bytes=st.session_state.last_file_bytes, key_prefix="chat_last")
+        if res == "delete":
+            st.session_state.last_output = ""
+            st.session_state.last_file_bytes = None
+            st.session_state.last_filename = "output.txt"
+            st.rerun()
+
+# --- Báo cáo
+elif menu == "📑 Báo cáo của tôi":
+    st.header("📑 Báo cáo")
+    st.write("Upload tài liệu (PDF/DOCX/Excel/Image/Audio) để AI trích xuất và sinh báo cáo.")
+    uploaded = st.file_uploader("Tải lên tài liệu", accept_multiple_files=False)
+    if uploaded:
+        target = INPUT_DIR / uploaded.name
+        with open(target, "wb") as f:
+            f.write(uploaded.getbuffer())
+        st.success(f"Đã lưu: {uploaded.name}")
+        # trích xuất preview
+        ext = target.suffix.lower()
+        txt_preview = ""
+        if ext == ".pdf":
+            txt_preview = extract_text_from_pdf(target)
+        elif ext == ".docx":
+            txt_preview = extract_text_from_docx(target)
+        elif ext in (".png", ".jpg", ".jpeg", ".tiff"):
+            txt_preview = extract_text_from_image(target)
+        elif ext in (".wav", ".mp3", ".flac"):
+            txt_preview = extract_text_from_audio(target)
+        elif ext in (".xls", ".xlsx", ".csv"):
+            df, err = read_excel_df(target)
+            if err:
+                txt_preview = err
+            else:
+                txt_preview = df.head(200).to_string()
+        else:
+            try:
+                txt_preview = uploaded.getvalue().decode(errors="ignore")
+            except:
+                txt_preview = "[Không thể đọc file]"
+        st.text_area("Nội dung trích xuất (xem nhanh)", txt_preview[:8000], height=260)
+        if st.button("Tạo báo cáo bằng AI"):
+            fut = background_process_file(target, task_type="report")
+            st.info("Đã bắt đầu tạo báo cáo trong nền. Kiểm tra tab Lịch sử khi hoàn thành.")
+
+    st.markdown("### Báo cáo đã tạo")
+    out_files = sorted(OUTPUT_DIR.glob("report_*.txt"), key=lambda p: p.stat().st_mtime, reverse=True)
+    for f in out_files[:10]:
+        st.markdown(f"**{f.name}** — {datetime.fromtimestamp(f.stat().st_mtime).isoformat()}")
+        content = f.read_text(encoding="utf-8")
+        st.text_area("Preview", content[:1500], height=180, key=f.name)
+        # actions
+        file_bytes = content.encode("utf-8")
+        act = action_buttons_for_text(content, filename=f.name, file_bytes=file_bytes, key_prefix=f"report_{f.name}")
+        if act == "delete":
+            try:
+                f.unlink()
+                st.success("Đã xóa file.")
+                st.experimental_rerun()
+            except Exception as e:
+                st.error(f"Lỗi xóa: {e}")
+
+# --- Quy chế
+elif menu == "📜 Quy chế":
+    st.header("📜 Quy chế")
+    st.write("Kho văn bản quy chế — upload tài liệu quy chế để hệ thống lưu trữ và cho phép truy vấn/nghiên cứu.")
+    uploaded = st.file_uploader("Upload file quy chế (PDF/DOCX)", key="quyche")
+    if uploaded:
+        t = INPUT_DIR / uploaded.name
+        with open(t, "wb") as f:
+            f.write(uploaded.getbuffer())
+        st.success("Đã lưu quy chế")
+        add_history({"type":"quyche","path":str(t),"timestamp":datetime.now().isoformat(),"preview":uploaded.name})
+
+# --- Công văn
+elif menu == "📝 Công văn":
+    st.header("📝 Soạn công văn")
+    with st.form("congvan_form"):
+        cv_title = st.text_input("Tiêu đề")
+        cv_recipient = st.text_input("Kính gửi")
+        cv_body = st.text_area("Nội dung chính", height=220)
+        add_signature = st.checkbox("Chèn chữ ký / con dấu (tải ảnh)", value=False)
+        signature_file = None
+        if add_signature:
+            signature_file = st.file_uploader("Tải ảnh chữ ký / con dấu", type=["png","jpg","jpeg"], key="sig")
+        sub = st.form_submit_button("Soạn công văn")
+        if sub:
+            prompt = f"Soạn công văn theo mẫu hành chính Việt Nam.\nTiêu đề: {cv_title}\nKính gửi: {cv_recipient}\nNội dung: {cv_body}"
+            with st.spinner("AI đang soạn công văn..."):
+                doc = call_ai(prompt)
+            # save
+            outp = OUTPUT_DIR / f"congvan_{datetime.now().strftime('%Y%m%d%H%M%S')}.txt"
+            outp.write_text(doc, encoding="utf-8")
+            add_history({"type":"congvan","title":cv_title,"path":str(outp),"timestamp":datetime.now().isoformat(),"preview":doc[:400]})
+            st.success("Đã tạo công văn")
+            st.text_area("Công văn", doc, height=300)
+            # if signature, append img note (for display/download user can combine externally)
+            if signature_file:
+                st.image(signature_file, caption="Chữ ký / con dấu", width=200)
+
+    # actions for last created
+    last_congvan = sorted(OUTPUT_DIR.glob("congvan_*.txt"), key=lambda p:p.stat().st_mtime, reverse=True)
+    if last_congvan:
+        f = last_congvan[0]
+        cont = f.read_text(encoding="utf-8")
+        st.markdown("### Công văn mới nhất")
+        st.text_area("Preview", cont, height=180)
+        act = action_buttons_for_text(cont, filename=f.name, file_bytes=cont.encode("utf-8"), key_prefix="cv_latest")
+        if act == "delete":
+            try:
+                f.unlink()
+                st.success("Đã xóa công văn")
+                st.rerun()
+            except Exception as e:
+                st.error(f"Lỗi xóa: {e}")
+
+# --- Kế hoạch
+elif menu == "📊 Kế hoạch":
+    st.header("📊 Kế hoạch")
+    st.write("Soạn kế hoạch hoặc phân tích dữ liệu để sinh kế hoạch.")
+    plan_text = st.text_area("Mô tả/ứng dụng cần lập kế hoạch", height=200)
+    if st.button("Tạo kế hoạch bằng AI"):
+        with st.spinner("AI đang tạo kế hoạch..."):
+            plan = call_ai(f"Từ nội dung sau, lập kế hoạch chi tiết:\n\n{plan_text}")
+        out = OUTPUT_DIR / f"kehoach_{datetime.now().strftime('%Y%m%d%H%M%S')}.txt"
+        out.write_text(plan, encoding="utf-8")
+        add_history({"type":"kehoach","path":str(out),"timestamp":datetime.now().isoformat(),"preview":plan[:400]})
+        st.success("Đã tạo kế hoạch")
+        st.text_area("Kế hoạch", plan, height=300)
+        act = action_buttons_for_text(plan, filename=out.name, file_bytes=plan.encode("utf-8"), key_prefix="plan_latest")
+        if act == "delete":
+            out.unlink()
+            st.success("Đã xóa kế hoạch")
+            st.rerun()
+
+# --- TTS
+elif menu == "🔊 Chuyển văn bản -> Giọng nói":
+    st.header("🔊 Text → Speech")
+    tts_text = st.text_area("Nhập văn bản để chuyển sang giọng nói", height=240)
+    tts_lang = st.selectbox("Ngôn ngữ", ["vi", "en"])
+    if st.button("Tạo audio"):
+        if gTTS is None:
+            st.error("gTTS chưa cài. Cài thêm gTTS vào requirements để dùng TTS.")
+        else:
+            try:
+                mp = io.BytesIO()
+                t = gTTS(tts_text, lang=tts_lang)
+                t.write_to_fp(mp)
+                mp.seek(0)
+                b = mp.read()
+                st.audio(b, format="audio/mp3")
+                st.session_state.last_file_bytes = b
+                st.session_state.last_filename = f"tts_{datetime.now().strftime('%Y%m%d%H%M%S')}.mp3"
+                add_history({"type":"tts","timestamp":datetime.now().isoformat(),"preview":tts_text[:200]})
+                act = action_buttons_for_text(tts_text, filename=st.session_state.last_filename, file_bytes=b, key_prefix="tts_latest")
+                if act == "delete":
+                    st.session_state.last_file_bytes = None
+                    st.session_state.last_filename = "output.mp3"
+                    st.rerun()
+            except Exception as e:
+                st.error(f"Lỗi tạo audio: {e}")
+
+# --- Video (placeholder)
+elif menu == "🎥 Video của tôi":
+    st.header("🎥 Quản lý Video")
+    v = st.file_uploader("Upload video (hiện lưu placeholder)", type=["mp4","mov","avi"])
+    if v:
+        t = INPUT_DIR / v.name
+        with open(t, "wb") as f:
+            f.write(v.getbuffer())
+        st.success("Đã lưu video. (Xử lý video nâng cao có thể thêm sau)")
+
+# --- Loại khác
+elif menu == "➕ Loại khác":
+    st.header("➕ Loại khác")
+    st.write("Các chức năng mở rộng: tích hợp cổng thông tin, API chính phủ, mẫu tài liệu đặc thù...")
+
+# --- Cấu hình & gửi
+elif menu == "⚙️ Cấu hình & Gửi":
+    st.header("⚙️ Cấu hình & Gửi")
+    st.markdown("Đặt biến môi trường trên Render hoặc .env (không push vào GitHub).")
+    st.write("Các biến quan trọng: OPENAI_API_KEY, EMAIL_USER, EMAIL_PASSWORD, ZALO_ACCESS_TOKEN, ZALO_USER_ID")
+    st.markdown("### Gửi thử Email / Zalo")
     col1, col2 = st.columns(2)
     with col1:
-        to = st.text_input("Địa chỉ email nhận", value=os.getenv("EMAIL_USER",""))
-        subject = st.text_input("Tiêu đề", value="Thông báo từ NgọcMinhChauAI")
-        body = st.text_area("Nội dung", value="Nội dung test", height=140)
+        to = st.text_input("Gửi tới (email)", value=os.getenv("EMAIL_USER",""))
+        subj = st.text_input("Tiêu đề", value="Thông báo từ NgocMinhChauAI")
+        body = st.text_area("Nội dung", value="Nội dung test", height=160)
         if st.button("Gửi Email thử"):
-            if send_email:
-                ok, msg = send_email(subject, body, to)
-                if ok:
-                    st.success("Gửi email thành công")
-                else:
-                    st.error(f"Gửi email lỗi: {msg}")
+            if send_email is None:
+                st.error("Hàm send_email chưa có (kiểm tra utils.py).")
             else:
-                st.error("Hàm gửi email chưa được cấu hình (utils.send_email).")
+                ok, msg = send_email(subj, body, to)
+                if ok: st.success("Gửi email thành công")
+                else: st.error(f"Lỗi gửi email: {msg}")
     with col2:
-        zalo_msg = st.text_area("Nội dung Zalo", value="Test Zalo", height=140)
+        zmsg = st.text_area("Nội dung Zalo", value="Test Zalo", height=160)
         if st.button("Gửi Zalo thử"):
-            if send_zalo_message:
-                ok = send_zalo_message(zalo_msg)
-                st.write(ok)
+            if send_zalo_message is None:
+                st.error("Hàm send_zalo_message chưa có (kiểm tra utils.py).")
             else:
-                st.error("Hàm gửi Zalo chưa được cấu hình (utils.send_zalo_message).")
+                ok, msg = send_zalo_message(zmsg)
+                if ok: st.success("Gửi Zalo thành công")
+                else: st.error(f"Lỗi gửi Zalo: {msg}")
+
+# ------------------------
+# Lịch sử & Backup (common foot)
+# ------------------------
+st.markdown("---")
+st.markdown("### Lịch sử & Sao lưu")
+history = load_history()
+if history:
+    st.write(f"Tổng bản ghi: {len(history)}")
+    if st.button("Xóa toàn bộ lịch sử"):
+        save_history([])
+        st.success("Đã xóa lịch sử")
+    if st.button("Tạo ZIP backup toàn bộ file output"):
+        ts = datetime.now().strftime("%Y%m%d%H%M%S")
+        zf = OUTPUT_DIR / f"backup_reports_{ts}.zip"
+        with zipfile.ZipFile(zf, "w") as z:
+            for f in OUTPUT_DIR.glob("*"):
+                z.write(f, arcname=f.name)
+        with open(zf, "rb") as fh:
+            st.download_button("Tải ZIP backup", fh, file_name=zf.name)
+else:
+    st.info("Hiện chưa có bản ghi nào.")
 
 st.markdown("---")
-st.markdown("© NgọcMinhChâu AI — Demo. Liên hệ để tùy biến & triển khai production.")
+st.markdown("© NgọcMinhChâu AI — Thiết kế theo yêu cầu. Liên hệ: Đoàn Thanh Châu — 0966313456")
